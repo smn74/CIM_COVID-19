@@ -1,0 +1,254 @@
+---
+title: "R-code for reanalysis of the COVID-19 study"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This file provides the code of the analysis described in Section 3.5 of Friedrich & Friede (2020). The data set is taken from Gautret et al. (2020).
+
+## Data preparation
+
+Following Gautret et al. (2020), we imput missing outcomes on Day 6 by a last-
+observation-carried-forward-approach, i. e. patients with missing PCR are considered positive on Day 6, if they were actually positive the day(s) before.
+
+```{r}
+library(Publish)
+library(data.table)
+library(survival)
+library(zoo)
+# Data preparation
+setwd("/home/friedrich79/Documents/Forschung/Goettingen/COVID-19/")
+covid <- read.csv("covid.csv", header=T)
+
+# Impute missing outcomes on Day 6
+covid[, 8:14] <- t(na.locf(t(covid[, 8:14])))
+covid <- as.data.table(covid)
+# drop unused variables
+covid[, c("D0", "D1", "D2", "D3", "D4", "D5", "azi") := NULL]
+## re-label outcome variable
+covid[, D6 := ifelse(D6 == "NEG", 1, 0)]
+setnames(covid, "D6", "outcome")
+covid[, hydro := ifelse(hydro == "no", 0, 1)]
+setnames(covid, "hydro", "trt")
+```
+
+After setting time since onset of symptoms to zero for asymptomatic patients, two patients with
+missing time since onset remain. Both patients are classified as URTI and we use the median time since onset (3 days) for URTI-patients to impute these missing values.
+
+```{r}
+# timeonset is zero for asymptomatic patients
+covid[clinicalstatus == "Asymptomatic", timeonset := 0]
+covid[is.na(timeonset)]
+# two missing values remain (both URTI), impute using median in the respective group
+replace <- covid[, median(timeonset[clinicalstatus=="URTI"], na.rm =T)]
+covid[is.na(timeonset), timeonset := replace]
+```
+
+## The PS-model
+
+Our PS-model includes sex, age, clinical status and time since onset of symptoms as explanatory variables.
+
+```{r}
+# propensity score model
+propmod <- glm(trt ~ sex + age + clinicalstatus + timeonset,
+               family="binomial", data = covid)
+# propensity score
+covid[, ps := predict(propmod, type = "response")]
+```
+
+### IPTW analysis
+
+```{r}
+# calculate IPTW 
+covid[trt == 1, w:= 1/ps]
+covid[trt == 0, w:= 1/(1-ps)]
+
+# simple model using weighted data with sandwich estimators
+fit.iptw <- glm(outcome ~ trt, data = covid, weights = w, family = binomial)
+library(sandwich)
+library(lmtest)
+tt <- coeftest(fit.iptw, vcov = sandwich)
+```
+
+### Doubly robust g-computation
+
+The Q-model for the g-computation additionally includes treatment status and the covariate z, which is equal to the IPT weight for the treatment group and equal to the negative IPT weight in the control group.
+
+```{r}
+# simple doubly robust model
+covid[trt == 0, z:= -w]
+covid[trt == 1, z:= w]
+ 
+## calculate confidence intervals using bootstrap
+###
+# function to calculate causal odds ratio including bootstrapped confidence intervals
+library(parallel)
+bootstrap <- function(data, iter = 1000, seed = 123, ...){
+  
+  # function to predict counterfactual outcomes for each hospital using g-formula
+  risks <- function(data, ...){
+    # fit Q-model for Y~A + L
+    fit <- glm(outcome ~  trt + z + sex + age + clinicalstatus + timeonset,
+               data, family = binomial)
+    
+    predictions <- list()
+    pot.outcome <- c(1, 0)
+    for(i in 1:2){
+      nd <- copy(data)
+      nd[, outcome:=NA]
+      nd[, trt := pot.outcome[i]]
+      predictions[[i]] <- predict(fit, newdata = nd, type = "response")
+    
+    }  
+    names(predictions) <- pot.outcome
+    effects <- sapply(FUN = mean, predictions)
+    
+    return(effects)
+  }
+  
+  risks.original <- risks(data)
+  
+  # bootstrapping
+  boot <- mclapply(X=1:iter, FUN=function(i, ...){
+    bindex <- sample(1:NROW(data), size = NROW(data), replace = TRUE)
+    bsample <- data[bindex]
+    b.risks <- risks(bsample)
+    return(b.risks)
+  })
+  
+ output <- list(risks=risks.original, boot = boot)
+  return(output)
+}
+
+causal.or <- function(risks, boot,  ...){
+  
+  Y_0 <- risks["0"]
+  Y_1 <- risks["1"]
+  
+  causal.or <- (Y_1/(1-Y_1))/(Y_0/(1-Y_0))
+  
+  Y_0_b <- sapply(boot, function(x){x["0"]})  
+  Y_1_b <- sapply(boot, function(x){x["1"]})
+  
+  causal.or.b <- (Y_1_b/(1-Y_1_b))/(Y_0_b/(1-Y_0_b))
+  
+  q2.5 <- quantile(causal.or.b, prob = 0.025)
+  q97.5 <- quantile(causal.or.b, prob = 0.975)
+  
+  COR <- c(q2.5, causal.or, q97.5)
+  names(COR) <- c("Lower", "Estimate", "Upper")
+  return(COR)
+}
+
+boots <- bootstrap(covid)
+CIboot <- causal.or(boots$risks, boots$boot)
+```
+
+### Matching
+
+The matching procedure results in a data set with 11 controls and 11 treated
+patients, thus discarding 5 controls and 9 treated patients from the analysis. 
+
+```{r}
+## Matching
+library(MatchIt)
+ps.mod <- matchit(trt ~ sex + age + clinicalstatus + timeonset, data = covid,
+                  method = "nearest", replace = FALSE, caliper = 0.2)
+m.data <- match.data(ps.mod, distance = "pscore")
+```
+
+Due to the small remaining sample size, the conditional logistic regression model does not converge at all, while the
+GEE procedure does not produce estimates of the standard errors and the simple model (match
+unadjusted) returned confidence intervals ranging from 0 to $\infty$. Thus, the matching procedure
+doesn't yield useful estimates and is discarded from the results displayed below. 
+
+#### Unconditional analysis
+
+```{r}
+# fit regression model on matched data (unconditional)
+fit.match <- glm(outcome ~ trt, data = m.data, family = binomial)
+tab <- regressionTable(fit.match)
+publish(tab$trt)
+```
+
+#### Conditional logistic regression
+
+```{r}
+# adjusting for matched pairs
+m.data$id <- rownames(m.data)
+m.data <- as.data.table(m.data)
+rn <- ps.mod$match.matrix[!is.na(ps.mod$match.matrix),]
+m.data[id %in% names(rn), matched.id := rn]
+m.data[is.na(matched.id), class:= id]
+m.data[!is.na(matched.id), class:= matched.id]
+# conditional logistic regression
+fit.match2 <- clogit(outcome ~ trt + strata(class), data = m.data)
+```
+
+#### GEE
+
+```{r}
+# GEE
+library(geepack)
+# data needs to be ordered
+m.data <- m.data[order(class), ]
+gee.matched <- geeglm(formula   = outcome ~ trt,
+                       family    = binomial(link = "logit"),
+                         id        = class,
+                         data      = m.data,
+                         corstr    = "exchangeable",
+                         scale.fix = FALSE)
+summary(gee.matched)
+```
+
+### Fitting the models and putting all results in a table
+
+```{r}
+# crude OR
+fit.unadj <- glm(outcome ~ trt, data = covid, family = binomial)
+tab.unadj <- regressionTable(fit.unadj)$trt
+
+# PS-covariate adjustment
+fit.c <- glm(outcome ~ trt + ps, data = covid, family = binomial)
+tab <- regressionTable(fit.c)
+tab.c <- tab$trt
+
+# results from the doubly robust g-estimation
+tab.g.double <- data.frame(Variable = "trt", Units = "", Missing = "", OddsRatio = CIboot["Estimate"], Lower = CIboot["Lower"], Upper = CIboot["Upper"] , Pvalue = NA)
+
+# results from the IPTW analysis
+tab.iptw <- data.frame(Variable = "trt", Units = "", Missing = "", OddsRatio = exp(tt[2, 1]), Lower = exp(confint(tt))[2, 1], Upper = exp(confint(tt))[2, 2] , Pvalue = tt[2, 4])
+
+table <- rbind(tab.unadj, tab.c, tab.iptw, tab.g.double)
+table <- table[, c("OddsRatio", "Lower", "Upper")]
+table$method <- c("Crude OR", "PS covariate", "IPTW analysis", "Doubly robust g-computation")
+knitr::kable(table)
+```
+
+
+```{r}
+library(ggplot2)
+theme_set(theme_bw())
+ggplot(table,aes(OddsRatio,method)) + 
+  geom_point(size=5, shape=18) +
+  geom_errorbarh(aes(xmax = Upper, xmin = Lower), height = 0.15, lwd=1) +
+  geom_vline(xintercept = 1, linetype = "longdash") +
+  scale_x_log10()+
+  theme(axis.text = element_text(size=14), axis.title = element_text(size = 14))+
+  labs(x="Odds Ratio", y="Method")
+```
+
+As we can see in the figure, all four methods (the crude unadjusted as well as the three
+causal inference methods) yield similar point estimates, which are, however, extremely large.
+Moreover, the methods differ with respect to statistical significance: The very wide confidence
+interval obtained by the doubly robust g-computation approach includes 1. 
+
+### References
+
+* Friedrich, S and Friede, T (2020). Causal inference methods for small non-randomized studies: Methods and an application in Covid-19.
+
+* Gautret, P., Lagier, J.-C., Parola, P., Meddeb, L., Mailhe, M., Doudier, B., Courjon, J., Giordanengo, V., Vieira, V. E., Dupont, H. T., et al. (2020). Hydroxychloroquine and azithromycin as a treatment of covid-19: results of an open-label non-randomized clinical trial. International journal of antimicrobial agents, page 105949.
+
