@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-This file provides the code of the analysis described in Section 3.5 of Friedrich & Friede (2020). The data set is taken from Gautret et al. (2020).
+This file provides the code of the analysis described in Section 3.5 of Friedrich & Friede (2020). The data set is taken from Gautret et al. (2020), https://doi.org/10.1016/j.ijantimicag.2020.105949, Supplementary Table 1.
 
 ## Data preparation
 
@@ -20,8 +20,7 @@ library(data.table)
 library(survival)
 library(zoo)
 # Data preparation
-setwd("/home/friedrich79/Documents/Forschung/Goettingen/COVID-19/")
-covid <- read.csv("covid.csv", header=T)
+covid <- readRDS("covid.rds")
 
 # Impute missing outcomes on Day 6
 covid[, 8:14] <- t(na.locf(t(covid[, 8:14])))
@@ -248,7 +247,7 @@ interval obtained by the doubly robust g-computation approach includes 1.
 
 ### References
 
-* Friedrich, S and Friede, T (2020). Causal inference methods for small non-randomized studies: Methods and an application in Covid-19.
+* Friedrich, S and Friede, T (2020). Causal inference methods for small non-randomized studies: Methods and an application in COVID-19.
 
 * Gautret, P., Lagier, J.-C., Parola, P., Meddeb, L., Mailhe, M., Doudier, B., Courjon, J., Giordanengo, V., Vieira, V. E., Dupont, H. T., et al. (2020). Hydroxychloroquine and azithromycin as a treatment of covid-19: results of an open-label non-randomized clinical trial. International journal of antimicrobial agents, page 105949.
 
