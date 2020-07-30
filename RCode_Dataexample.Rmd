@@ -85,7 +85,7 @@ covid[trt == 1, z:= w]
 ###
 # function to calculate causal odds ratio including bootstrapped confidence intervals
 library(parallel)
-bootstrap <- function(data, iter = 1000, seed = 123, ...){
+bootstrap <- function(data, iter = 10000, seed = 123, ...){
   
   # function to predict counterfactual outcomes for each hospital using g-formula
   risks <- function(data, ...){
