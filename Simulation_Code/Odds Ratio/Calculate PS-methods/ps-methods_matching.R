@@ -3,7 +3,7 @@
 ps_methods <- function(dt, ...){
   ## 2.) Matching
   ps.mod <- matchit(trt ~ x1+ x2+x3+x4, data = dt,
-                    method = "nearest", replace = FALSE, caliper = 0.2)
+                    method = "nearest", replace = FALSE, caliper = 0.2, distance = "linear.logit")
   m.data <- match.data(ps.mod, distance = "pscore")
   # fit regression model on matched data (unconditional)
   fit.match <- glm(outcome ~ trt, data = m.data, family = binomial)
