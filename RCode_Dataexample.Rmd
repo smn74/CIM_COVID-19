@@ -7,7 +7,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-This file provides the code of the analysis described in Section 3.5 of Friedrich & Friede (2020). The data set is taken from Gautret et al. (2020), https://doi.org/10.1016/j.ijantimicag.2020.105949, Supplementary Table 1.
+This file provides the code for the reanalysis mentioned in the Discussion of Friedrich & Friede (2020). The data set is taken from Gautret et al. (2020), https://doi.org/10.1016/j.ijantimicag.2020.105949, Supplementary Table 1.
 
 ## Data preparation
 
@@ -20,7 +20,10 @@ library(data.table)
 library(survival)
 library(ggplot2)
 library(zoo)
-library(logistf)
+library(survey)
+library(lmtest)
+library(sandwich)
+library(parallel)
 # Data preparation
 covid <- readRDS("covid.rds")
 
@@ -95,14 +98,16 @@ panel.background = element_blank(), axis.line = element_line(colour = "black"))
 covid[trt == 1, w:= 1/ps]
 covid[trt == 0, w:= 1/(1-ps)]
 
-# simple model using weighted data with sandwich estimators
-fit.iptw <- glm(outcome ~ trt, data = covid, weights = w, family = binomial)
-library(sandwich)
-library(lmtest)
-tt <- coeftest(fit.iptw, vcov = sandwich)
+## risk difference
+# survey package:
+msm <- svyglm(outcome ~ trt, design = svydesign(~1, weights = ~w, data = covid))
+est.msm <- msm$coefficients["trt"]
+stderror.msm <- coeftest(msm, vcov = vcovHC(msm, type = "HC3"))[2,2]
+ci.iptw <- c(est.msm - 1.96*stderror.msm, est.msm, est.msm + 1.96*stderror.msm)
+names(ci.iptw) <- c("Lower", "Estimate", "Upper")
 ```
 
-### Doubly robust g-computation
+### Simple DR g-computation
 
 The Q-model for the g-computation additionally includes treatment status and the covariate z, which is equal to the IPT weight for the treatment group and equal to the negative IPT weight in the control group.
 
@@ -112,71 +117,10 @@ covid[trt == 0, z:= -w]
 covid[trt == 1, z:= w]
  
 ## calculate confidence intervals using bootstrap
-###
-# function to calculate causal odds ratio including bootstrapped confidence intervals
-library(parallel)
-bootstrap <- function(data, form, iter = 10000, seed = 123, ...){
-  
-  # function to predict counterfactual outcomes for each hospital using g-formula
-  risks <- function(data, form, ...){
-    # fit Q-model for Y~A + L
-    fit <- glm(form,
-               data, family = binomial)
-    
-    predictions <- list()
-    pot.outcome <- c(1, 0)
-    for(i in 1:2){
-      nd <- copy(data)
-      nd[, outcome:=NA]
-      nd[, trt := pot.outcome[i]]
-      predictions[[i]] <- predict(fit, newdata = nd, type = "response")
-    
-    }  
-    names(predictions) <- pot.outcome
-    effects <- sapply(FUN = mean, predictions)
-    
-    return(effects)
-  }
-  
-  risks.original <- risks(data, form)
-  
-  # bootstrapping
-  boot <- mclapply(X=1:iter, FUN=function(i, ...){
-    bindex <- sample(1:NROW(data), size = NROW(data), replace = TRUE)
-    bsample <- data[bindex]
-    b.risks <- risks(bsample, form)
-    return(b.risks)
-  })
-  
- output <- list(risks=risks.original, boot = boot)
-  return(output)
-}
-
-causal.or <- function(risks, boot,  ...){
-  
-  Y_0 <- risks["0"]
-  Y_1 <- risks["1"]
-  
-  causal.or <- (Y_1/(1-Y_1))/(Y_0/(1-Y_0))
-  
-  Y_0_b <- sapply(boot, function(x){x["0"]})  
-  Y_1_b <- sapply(boot, function(x){x["1"]})
-  
-  causal.or.b <- (Y_1_b/(1-Y_1_b))/(Y_0_b/(1-Y_0_b))
-  
-  q2.5 <- quantile(causal.or.b, prob = 0.025)
-  q97.5 <- quantile(causal.or.b, prob = 0.975)
-  
-  COR <- c(q2.5, causal.or, q97.5)
-  names(COR) <- c("Lower", "Estimate", "Upper")
-  return(COR)
-}
-
-boots <- bootstrap(covid, form = outcome ~  trt + z + sex + age + clinicalstatus + timeonset)
-CIboot <- causal.or(boots$risks, boots$boot)
+source("bootstrap_RD.R")
+boots <- bootstrap(covid, form = outcome ~ trt + z + age + sex + clinicalstatus + timeonset)
+CIboot <- causal.rd(boots$risks, boots$boot)
 ```
-
-Another possibility for a doubly robust estimator, which performed better according to Kang & Schafer (2007) is based on dummy variables according to the quintiles of the logit of the PS.
 
 ```{r}
 # the same with dummy categories for logit(ps)-quintiles
@@ -189,10 +133,10 @@ covid[, z2:= as.numeric(qt[2] < logitps & logitps < qt[3])]
 covid[, z3:= as.numeric(qt[3] < logitps & logitps < qt[4])]
 covid[, z4:= as.numeric(qt[4] < logitps & logitps < qt[5])]
 
-boots2 <- bootstrap(covid, form = outcome ~  trt + z1 + z2 + z3 + z4 + sex + age + clinicalstatus + timeonset)
-CIboot2 <- causal.or(boots2$risks, boots2$boot)
+## calculate confidence intervals using bootstrap
+boots.q <- bootstrap(covid, form = outcome ~ trt + z1 + z2 + z3 + z4 + age + sex + clinicalstatus + timeonset)
+CIboot.q <- causal.rd(boots.q$risks, boots.q$boot)
 ```
-
 
 ### Matching
 
@@ -203,225 +147,80 @@ patients, thus discarding 5 controls and 9 treated patients from the analysis.
 ## Matching
 library(MatchIt)
 ps.mod <- matchit(trt ~ sex + age + clinicalstatus + timeonset, data = covid,
-                  method = "nearest", replace = FALSE, caliper = 0.2)
+                  method = "nearest", replace = FALSE, caliper = 0.2, distance = "linear.logit")
 m.data <- match.data(ps.mod, distance = "pscore")
-```
-
-Due to the small remaining sample size, the conditional logistic regression model does not converge at all, while the
-GEE procedure does not produce estimates of the standard errors and the simple model (match
-unadjusted) returned confidence intervals ranging from 0 to $\infty$. Thus, the matching procedure
-doesn't yield useful estimates and is discarded from the results displayed below. 
-
-#### Unconditional analysis
-
-```{r}
-# fit regression model on matched data (unconditional)
-fit.match <- logistf(outcome ~ trt, data = m.data, family = binomial)
-```
-
-#### Conditional logistic regression
-
-```{r}
-# adjusting for matched pairs
-m.data$id <- rownames(m.data)
 m.data <- as.data.table(m.data)
-rn <- ps.mod$match.matrix[!is.na(ps.mod$match.matrix),]
-m.data[id %in% names(rn), matched.id := rn]
-m.data[is.na(matched.id), class:= id]
-m.data[!is.na(matched.id), class:= matched.id]
-# conditional logistic regression
-fit.match2 <- clogit(outcome ~ trt + strata(class), data = m.data)
-```
-
-#### GEE
-
-```{r}
-# GEE
-library(geepack)
-# data needs to be ordered
-m.data <- m.data[order(class), ]
-gee.matched <- geeglm(formula   = outcome ~ trt,
-                       family    = binomial(link = "logit"),
-                         id        = class,
-                         data      = m.data,
-                         corstr    = "exchangeable",
-                         scale.fix = FALSE)
-summary(gee.matched)
-```
-
-### Fitting the models and putting all results in a table
-
-```{r}
-# crude OR
-fit.unadj <- glm(outcome ~ trt, data = covid, family = binomial)
-tab.unadj <- regressionTable(fit.unadj)$trt[c("OddsRatio", "Lower", "Upper")]
-
-# covariate adjustment using Firth correction
-fit.adj <- logistf(outcome ~ trt + sex + age + clinicalstatus + timeonset, data = covid)
-tab.adj <- data.frame(OddsRatio = exp(fit.adj$coefficients[2]), Lower = exp(confint(fit.adj)[2, 1]), Upper = exp(confint(fit.adj)[2, 2]))
-
-# PS-covariate adjustment
-fit.c <- glm(outcome ~ trt + ps, data = covid, family = binomial)
-tab <- regressionTable(fit.c)
-tab.c <- tab$trt[c("OddsRatio", "Lower", "Upper")]
-
-# results from the doubly robust g-estimation
-tab.g.double <- data.frame(OddsRatio = CIboot["Estimate"], Lower = CIboot["Lower"], Upper = CIboot["Upper"])
-
-tab.g.double2 <- data.frame(OddsRatio = CIboot2["Estimate"], Lower = CIboot2["Lower"], Upper = CIboot2["Upper"])
-
-# results from matching
-tab.match <- data.frame(OddsRatio = exp(fit.match$coefficients[2]), Lower = exp(confint(fit.match)[2, 1]), Upper = exp(confint(fit.match)[2, 2]))
-
-# results from the IPTW analysis
-tab.iptw <- data.frame(OddsRatio = exp(tt[2, 1]), Lower = exp(confint(tt))[2, 1], Upper = exp(confint(tt))[2, 2])
-
-table <- rbind(tab.unadj, tab.adj, tab.c, tab.iptw, tab.g.double, tab.g.double2, tab.match)
-table$method <- c("Crude OR", "Covariate adjusted (Firth)", "PS covariate", "IPTW", "Simple DR g-computation", "DR using quintiles", "Matching (Firth)")
-knitr::kable(table)
-```
-
-
-```{r}
-theme_set(theme_bw())
-p1 <- ggplot(table,aes(OddsRatio,method)) + 
-  geom_point(size=5, shape=18) +
-  geom_errorbarh(aes(xmax = Upper, xmin = Lower), height = 0.15, lwd=1) +
-  geom_vline(xintercept = 1, linetype = "longdash") +
-  scale_x_log10()+
-  theme(axis.text = element_text(size=14), axis.title = element_text(size = 14))+
-  labs(x="Odds Ratio", y="Method")
-p1
-```
-
-```{r,include=FALSE}
-pdf(file = "Figures/Plot_OR_dataex.pdf")
-p1
-dev.off()
-```
-
-As we can see in the figure, all four methods (the crude unadjusted as well as the three
-causal inference methods) yield similar point estimates, which are, however, extremely large.
-Moreover, the methods differ with respect to statistical significance: The very wide confidence
-interval obtained by the doubly robust g-computation approach includes 1. 
-
-## Risk Difference
-
-### IPTW analysis
-
-```{r}
-## risk difference
-# survey package:
-library(survey)
-msm <- svyglm(outcome ~ trt, design = svydesign(~1, weights = ~w, data = covid))
-ci.iptw <- c(confint(msm)[1, 2], coef(msm)[2], confint(msm)[2, 2])
-names(ci.iptw) <- c("Lower", "Estimate", "Upper")
-```
-
-### Doubly robust g-computation
-
-The Q-model for the g-computation additionally includes treatment status and the covariate z, which is equal to the IPT weight for the treatment group and equal to the negative IPT weight in the control group.
-
-```{r}
-# function for calculating risk difference instead of OR
-causal.rd <- function(risks, boot, ...){
-  
-  Y_0 <- risks["0"]
-  Y_1 <- risks["1"]
-  
-  causal.rd <- Y_1 -Y_0
-  
-  Y_0_b <- sapply(boot, function(x){x["0"]})  
-  Y_1_b <- sapply(boot, function(x){x["1"]})
-  
-  causal.rd.b <- Y_1_b-Y_0_b
-  
-  q2.5 <- quantile(causal.rd.b, prob = 0.025)
-  q97.5 <- quantile(causal.rd.b, prob = 0.975)
-  
-  CRD <- c(q2.5, causal.rd, q97.5)
-  names(CRD) <- c("Lower", "Estimate", "Upper")
-  return(CRD)
-}
-CIboot.rd <- causal.rd(boots$risks, boots$boot)
-```
-
-For the second DR estimator, we instead include dummy variables corresponding to the quintiles of the logit of the PS in the Q-model: 
-
-```{r}
-## calculate confidence intervals using bootstrap
-CIboot.rd2 <- causal.rd(boots2$risks, boots2$boot)
-```
-
-### Matching
-
-```{r}
-## Matching
 # b: only treated experience the event
 b <- m.data[trt ==1 & outcome == 1, .N]
 # c: only untreated experience the event
 c <- m.data[trt ==0 & outcome == 1, .N]
 # n: number of matched pairs
 n <- (NROW(m.data)/2)
-
+  
 diff.match <- (b-c)/n
 var <- ((b+c)-(c-b)^2/n)/n
 ci.match <- c(diff.match - 1.96*var, diff.match, diff.match + 1.96*var)
+names(ci.match) <- c("Lower", "Estimate", "Upper")
 ```
+
+### AIPW
+
+```{r}
+library(PSW)
+source("psw-code_dataex.R")
+form.ps <- "trt ~ sex + age + timeonset + clinicalstatus"
+form.out <- "outcome ~ sex + age +  timeonset + clinicalstatus"
+tmp <- ps.aug(data = covid, form.ps = form.ps, weight = "ATE",form.outcome = form.out, family="binomial")
+ci.aipw <- c(tmp$est.risk - 1.96*tmp$std.risk, tmp$est.risk, tmp$est.risk + 1.96*tmp$std.risk)
+names(ci.aipw) <- c("Lower", "Estimate", "Upper")
+  
+```
+  
 
 ### Fitting the models and putting all results in a table
 
 ```{r}
-# PS-covariate adjustment: binomial model with identity link does not converge
-glm.adj <- try(glm(outcome ~ trt + age + sex + clinicalstatus + timeonset, data = covid, family = binomial(link = "identity")))
-# using linear model instead
-lm.adj <- lm(outcome ~ trt + age + sex + clinicalstatus + timeonset, data = covid)
-ci.adj <- c(confint(lm.adj)[2, 1], lm.adj$coefficients[2], confint(lm.adj)[2, 2])
-names(ci.adj) <- c("Lower", "Estimate", "Upper")
-
-## covariate adjustment using PS: no valid set of coefficients found
-glm.cov <- try(glm(outcome ~ trt + ps, data = covid, family = binomial(link = "identity")))
-# using linear model instead
-lm.PScov <- lm(outcome ~ trt + ps, data = covid)
-ci.PScov <- c(confint(lm.PScov)[2, 1], lm.PScov$coefficients[2], confint(lm.PScov)[2, 2])
-names(ci.PScov) <- c("Lower", "Estimate", "Upper")
-```
-
-```{r}
-# crude (unadjusted) risk difference
-ex <- covid[trt == 1, .N]
-unex <- covid[trt == 0, .N]
-ex.event <- covid[trt == 1 & outcome == 1, .N]
-unex.event <- covid[trt == 0 & outcome == 1, .N]
-
-library(fmsb)
-rd <- riskdifference(ex.event, unex.event, ex, unex)
-ci.unadjusted <- c(rd$conf.int[1], rd$estimate, rd$conf.int[2])
+# 1.) crude risk difference
+rd <- lm(outcome ~ trt, data = covid)
+est <- rd$coefficients["trt"]
+stderror <- coeftest(rd, vcov = vcovHC(rd, type = "HC3"))[2,2]
+ci.unadjusted <- c(est - 1.96*stderror, est, est + 1.96*stderror)
 names(ci.unadjusted) <- c("Lower", "Estimate", "Upper")
+  
+# 2.) covariate adjustment
+lm.adj <- lm(outcome ~ trt + sex + age + clinicalstatus + timeonset, data = covid)
+est.a <- lm.adj$coefficients["trt"]
+stderror.a <- coeftest(lm.adj, vcov = vcovHC(lm.adj, type = "HC3"))[2,2]
+ci.adj <- c(est.a - 1.96*stderror.a, est.a, est.a + 1.96*stderror.a)
+names(ci.adj) <- c("Lower", "Estimate", "Upper")
+  
+## 3.) PS covariate
+lm.PScov <- lm(outcome ~ trt + ps, data = covid)
+est.ps <- lm.PScov$coefficients["trt"]
+stderror.ps <- coeftest(lm.PScov, vcov = vcovHC(lm.PScov, type = "HC3"))[2,2]
+ci.PScov <- c(est.ps - 1.96*stderror.ps, est.ps, est.ps + 1.96*stderror.ps)
+names(ci.PScov) <- c("Lower", "Estimate", "Upper")
 
-table2 <- as.data.frame(rbind(ci.unadjusted, ci.adj, ci.iptw, ci.PScov, ci.match, CIboot.rd, CIboot.rd2))
-table2$method <- c("Crude risk difference", "Covariate adjusted", "IPTW", "PS covariate", "Matching", "Simple DR g-computation", "DR using quintiles")
-knitr::kable(table2)
+table <- as.data.frame(rbind(ci.unadjusted, ci.adj, ci.PScov, ci.iptw, ci.match, CIboot, CIboot.q, ci.aipw))
+table$method <- c("Crude risk difference", "Covariate adjusted RD", "PS covariate", "IPTW", "Matching", "Simple DR g-computation", "DR using quintile", "AIPW")
+knitr::kable(table)
 ```
 
 
 ```{r}
 theme_set(theme_bw())
-p2 <- ggplot(table2,aes(Estimate,method)) + 
+ggplot(table,aes(Estimate,method)) + 
   geom_point(size=5, shape=18) +
   geom_errorbarh(aes(xmax = Upper, xmin = Lower), height = 0.15, lwd=1) +
   geom_vline(xintercept = 0, linetype = "longdash") +
   #scale_x_log10()+
   theme(axis.text = element_text(size=14), axis.title = element_text(size = 14))+
   labs(x="Risk difference", y="Method")
-p2
 ```
 
-```{r, include = FALSE}
-pdf(file = "Figures/Plot_RD_dataex.pdf")
-p2
-dev.off()
-```
+As we can see in the figure, all methods yield similar rather large point estimates.
+However, the methods differ with respect to statistical significance: The very wide confidence
+interval obtained by the simple DR g-computation approach includes 0. As noted in the simulation study in Friedrich & Friede (2020), the simple DR g-computation should not be trusted due to the very wide and often uninformative confidence intervals.
 
 ### References
 
