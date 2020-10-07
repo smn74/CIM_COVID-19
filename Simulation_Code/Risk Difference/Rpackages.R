@@ -1,0 +1,10 @@
+## load R packages
+library(data.table, lib.loc="~/localRpackages")
+library(survival, lib.loc = "~/localRpackages")
+library(prodlim, lib.loc = "~/localRpackages")
+library(Publish, lib.loc="~/localRpackages")
+library(parallel, lib.loc="~/localRpackages")
+library(survey, lib.loc="~/localRpackages")
+library(latticeExtra, lib.loc="~/localRpackages")
+library(Hmisc, lib.loc="~/localRpackages")
+library(PSW, lib.loc="~/localRpackages")
